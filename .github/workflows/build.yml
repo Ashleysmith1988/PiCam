@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 defaults:
   run:
     working-directory: PiCamApp
@@ -20,6 +23,8 @@ jobs:
           java-version: '17'
 
       - name: Build APK
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
         run: |
           chmod +x gradlew
           ./gradlew assembleRelease --no-daemon
@@ -31,3 +36,10 @@ jobs:
         with:
           name: PiCam-apk
           path: PiCamApp/PiCam.apk
+
+      - name: Publish release for the in-app updater
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: PiCam build ${{ github.run_number }}
+          files: PiCamApp/PiCam.apk
