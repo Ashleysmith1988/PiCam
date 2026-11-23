@@ -1,15 +1,21 @@
 package uk.picam.viewer;
 
 import android.app.Activity;
+import android.app.PendingIntent;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageInstaller;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.text.InputType;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -29,8 +35,15 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
@@ -39,6 +52,7 @@ import java.util.List;
 /**
  * PiCam viewer: finds the Pi (saved address, picam.local, or the PiCam hotspot)
  * and shows its stream full screen. The VR and Settings pages come from the Pi.
+ * Press Back to reach the main screen, which also has the Update button.
  */
 public class MainActivity extends Activity {
 
@@ -46,15 +60,23 @@ public class MainActivity extends Activity {
     private static final String DEFAULT_ADDRESS = "192.168.0.33";
     private static final String HOTSPOT_ADDRESS = "10.42.0.1";
 
+    // Updates are taken from the latest release in this GitHub repository
+    private static final String GITHUB_REPO = "Ashleysmith1988/PiCam";
+    private static final String ACTION_INSTALL_STATUS = "uk.picam.viewer.INSTALL_STATUS";
+
     private SharedPreferences prefs;
     private WebView web;
-    private LinearLayout connectPanel;
+    private View connectPanel;
     private EditText addressBox;
     private TextView statusText;
+    private TextView versionText;
     private Button connectButton;
+    private Button updateButton;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private volatile boolean searching = false;
+    private volatile boolean updating = false;
     private String currentHost = null;
+    private String updateApkUrl = null;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -77,6 +99,7 @@ public class MainActivity extends Activity {
         setContentView(root);
         goFullScreen();
         findPi();
+        checkForUpdate(false);   // quiet check; the button changes if one is found
     }
 
     // ---------------------------------------------------------------- WebView
@@ -88,14 +111,14 @@ public class MainActivity extends Activity {
         s.setLoadWithOverviewMode(true);
         s.setUseWideViewPort(true);
         s.setCacheMode(WebSettings.LOAD_NO_CACHE);
-        if (Build.VERSION.SDK_INT >= 17) s.setMediaPlaybackRequiresUserGesture(false);
+        s.setMediaPlaybackRequiresUserGesture(false);
 
         web.setWebChromeClient(new WebChromeClient());
         web.setWebViewClient(new WebViewClient() {
             @Override
             public void onReceivedError(WebView view, WebResourceRequest req,
                                         WebResourceError err) {
-                if (Build.VERSION.SDK_INT >= 21 && req.isForMainFrame()) lostConnection();
+                if (req.isForMainFrame()) lostConnection();
             }
 
             @SuppressWarnings("deprecation")
@@ -121,8 +144,7 @@ public class MainActivity extends Activity {
         connectButton.setEnabled(false);
 
         final List<String> candidates = new ArrayList<>();
-        String saved = prefs.getString("address", DEFAULT_ADDRESS);
-        candidates.add(saved);
+        candidates.add(prefs.getString("address", DEFAULT_ADDRESS));
         if (!candidates.contains("picam.local")) candidates.add("picam.local");
         if (!candidates.contains(HOTSPOT_ADDRESS)) candidates.add(HOTSPOT_ADDRESS);
 
@@ -178,7 +200,6 @@ public class MainActivity extends Activity {
 
     private void openStream(String host) {
         currentHost = host;
-        // Remember IP addresses that work (not the fallbacks)
         if (!host.equals(HOTSPOT_ADDRESS) && !host.equals("picam.local")) {
             prefs.edit().putString("address", host).apply();
         }
@@ -189,14 +210,203 @@ public class MainActivity extends Activity {
         goFullScreen();
     }
 
-    // ----------------------------------------------------------- Connect panel
-    private LinearLayout buildConnectPanel() {
+    // ----------------------------------------------------------------- Updates
+    private int installedBuild() {
+        try {
+            PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0);
+            if (Build.VERSION.SDK_INT >= 28) return (int) pi.getLongVersionCode();
+            //noinspection deprecation
+            return pi.versionCode;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private static String readAll(InputStream in) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        in.close();
+        return out.toString("UTF-8");
+    }
+
+    /** Asks GitHub for the latest release and compares its build number with ours. */
+    private void checkForUpdate(final boolean userAsked) {
+        if (updating) return;
+        if (userAsked) {
+            updateButton.setEnabled(false);
+            updateButton.setText("Checking for updates...");
+        }
+        new Thread(() -> {
+            int latest = -1;
+            String apkUrl = null;
+            String error = null;
+            HttpURLConnection c = null;
+            try {
+                c = (HttpURLConnection) new URL("https://api.github.com/repos/"
+                        + GITHUB_REPO + "/releases/latest").openConnection();
+                c.setRequestProperty("User-Agent", "PiCam-app");
+                c.setRequestProperty("Accept", "application/vnd.github+json");
+                c.setConnectTimeout(6000);
+                c.setReadTimeout(10000);
+                int code = c.getResponseCode();
+                if (code == 200) {
+                    JSONObject j = new JSONObject(readAll(c.getInputStream()));
+                    String digits = j.optString("tag_name", "").replaceAll("\\D", "");
+                    if (!digits.isEmpty()) latest = Integer.parseInt(digits);
+                    JSONArray assets = j.optJSONArray("assets");
+                    if (assets != null) {
+                        for (int i = 0; i < assets.length(); i++) {
+                            JSONObject a = assets.getJSONObject(i);
+                            if (a.optString("name").toLowerCase().endsWith(".apk")) {
+                                apkUrl = a.optString("browser_download_url");
+                                break;
+                            }
+                        }
+                    }
+                } else if (code == 404) {
+                    error = "no releases published yet";
+                } else {
+                    error = "GitHub replied " + code;
+                }
+            } catch (Exception e) {
+                error = "no internet connection";
+            } finally {
+                if (c != null) c.disconnect();
+            }
+
+            final int latestBuild = latest;
+            final String url = apkUrl;
+            final String err = error;
+            ui.post(() -> {
+                updateButton.setEnabled(true);
+                int mine = installedBuild();
+                if (url != null && latestBuild > mine) {
+                    updateApkUrl = url;
+                    updateButton.setText("Install update (build " + latestBuild + ")");
+                    styleButton(updateButton, "#2E9E4F");
+                } else if (userAsked) {
+                    updateButton.setText(err != null
+                            ? "Couldn't check: " + err + " - tap to retry"
+                            : "Up to date (build " + mine + ") - tap to check again");
+                }
+            });
+        }).start();
+    }
+
+    private void onUpdateButton() {
+        if (updateApkUrl == null) {
+            checkForUpdate(true);
+            return;
+        }
+        // Android 8+: PiCam needs permission to install apps (asked once)
+        if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+            updateButton.setText("Allow PiCam to install apps, then tap here again");
+            startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:" + getPackageName())));
+            return;
+        }
+        downloadAndInstall(updateApkUrl);
+    }
+
+    private void downloadAndInstall(final String apkUrl) {
+        updating = true;
+        updateButton.setEnabled(false);
+        updateButton.setText("Downloading update...");
+        new Thread(() -> {
+            HttpURLConnection c = null;
+            PackageInstaller.Session session = null;
+            try {
+                c = (HttpURLConnection) new URL(apkUrl).openConnection();
+                c.setInstanceFollowRedirects(true);
+                c.setRequestProperty("User-Agent", "PiCam-app");
+                c.setConnectTimeout(10000);
+                c.setReadTimeout(30000);
+                if (c.getResponseCode() != 200)
+                    throw new Exception("download failed (" + c.getResponseCode() + ")");
+                final long total = c.getContentLength();
+
+                PackageInstaller installer = getPackageManager().getPackageInstaller();
+                PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(
+                        PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+                session = installer.openSession(installer.createSession(params));
+
+                InputStream in = c.getInputStream();
+                OutputStream out = session.openWrite("picam.apk", 0, total > 0 ? total : -1);
+                byte[] buf = new byte[65536];
+                long done = 0;
+                int n, lastPct = -1;
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                    done += n;
+                    if (total > 0) {
+                        final int pct = (int) (done * 100 / total);
+                        if (pct != lastPct) {
+                            lastPct = pct;
+                            ui.post(() -> updateButton.setText("Downloading update... " + pct + "%"));
+                        }
+                    }
+                }
+                session.fsync(out);
+                out.close();
+                in.close();
+
+                Intent status = new Intent(this, MainActivity.class)
+                        .setAction(ACTION_INSTALL_STATUS);
+                int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+                if (Build.VERSION.SDK_INT >= 31) flags |= PendingIntent.FLAG_MUTABLE;
+                PendingIntent pi = PendingIntent.getActivity(this, 0, status, flags);
+                session.commit(pi.getIntentSender());
+                session.close();
+                session = null;
+                ui.post(() -> updateButton.setText("Installing..."));
+            } catch (final Exception e) {
+                if (session != null) session.abandon();
+                ui.post(() -> {
+                    updating = false;
+                    updateButton.setEnabled(true);
+                    updateButton.setText("Update failed: " + e.getMessage() + " - tap to retry");
+                });
+            } finally {
+                if (c != null) c.disconnect();
+            }
+        }).start();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        if (!ACTION_INSTALL_STATUS.equals(intent.getAction())) return;
+        int status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, -999);
+        if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+            //noinspection deprecation
+            Intent confirm = intent.getParcelableExtra(Intent.EXTRA_INTENT);
+            if (confirm != null) startActivity(confirm);   // Android's "Install?" prompt
+        } else if (status == PackageInstaller.STATUS_SUCCESS) {
+            updateButton.setText("Updated - reopen PiCam");
+        } else {
+            updating = false;
+            updateButton.setEnabled(true);
+            String msg = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+            updateButton.setText("Update cancelled or failed"
+                    + (msg != null ? ": " + msg : "") + " - tap to retry");
+        }
+    }
+
+    // ----------------------------------------------------------- Main screen
+    private View buildConnectPanel() {
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.setBackgroundColor(Color.parseColor("#111111"));
+
         LinearLayout p = new LinearLayout(this);
         p.setOrientation(LinearLayout.VERTICAL);
         p.setGravity(Gravity.CENTER);
-        p.setBackgroundColor(Color.parseColor("#111111"));
         int pad = dp(28);
         p.setPadding(pad, pad, pad, pad);
+        scroll.addView(p, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         TextView title = new TextView(this);
         title.setText("PiCam");
@@ -241,14 +451,28 @@ public class MainActivity extends Activity {
         retry.setOnClickListener(v -> findPi());
         p.addView(retry, buttonParams());
 
+        updateButton = makeButton("Check for updates", "#333333");
+        updateButton.setOnClickListener(v -> onUpdateButton());
+        LinearLayout.LayoutParams ulp = buttonParams();
+        ulp.topMargin = dp(28);
+        p.addView(updateButton, ulp);
+
+        versionText = new TextView(this);
+        versionText.setText("PiCam app build " + installedBuild());
+        versionText.setTextColor(Color.parseColor("#777777"));
+        versionText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        versionText.setGravity(Gravity.CENTER);
+        versionText.setPadding(0, dp(10), 0, 0);
+        p.addView(versionText);
+
         TextView tip = new TextView(this);
         tip.setText("Tip: press Back on the camera view to return here.");
         tip.setTextColor(Color.parseColor("#777777"));
         tip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         tip.setGravity(Gravity.CENTER);
-        tip.setPadding(0, dp(20), 0, 0);
+        tip.setPadding(0, dp(6), 0, 0);
         p.addView(tip);
-        return p;
+        return scroll;
     }
 
     private void connectTyped() {
@@ -285,11 +509,15 @@ public class MainActivity extends Activity {
         b.setAllCaps(false);
         b.setTextColor(Color.WHITE);
         b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        styleButton(b, colour);
+        return b;
+    }
+
+    private void styleButton(Button b, String colour) {
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(Color.parseColor(colour));
         bg.setCornerRadius(dp(8));
         b.setBackground(bg);
-        return b;
     }
 
     private LinearLayout.LayoutParams buttonParams() {

@@ -2,6 +2,9 @@ plugins {
     id 'com.android.application'
 }
 
+// GitHub passes its run number in, so every build gets a higher version
+def buildNumber = (System.getenv('BUILD_NUMBER') ?: '1') as Integer
+
 android {
     namespace 'uk.picam.viewer'
     compileSdk 35
@@ -10,15 +13,24 @@ android {
         applicationId 'uk.picam.viewer'
         minSdk 21          // Android 5.0+, covers every Galaxy Tab A
         targetSdk 35
-        versionCode 1
-        versionName '1.0'
+        versionCode buildNumber
+        versionName "1.${buildNumber}"
+    }
+
+    // Fixed key, so each new version installs over the old one
+    signingConfigs {
+        picam {
+            storeFile file('picam.keystore')
+            storePassword 'picam123'
+            keyAlias 'picam'
+            keyPassword 'picam123'
+        }
     }
 
     buildTypes {
         release {
             minifyEnabled false
-            // Signed with the debug key so the APK installs straight away
-            signingConfig signingConfigs.debug
+            signingConfig signingConfigs.picam
         }
     }
 
