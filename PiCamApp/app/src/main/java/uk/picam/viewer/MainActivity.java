@@ -92,6 +92,23 @@ public class MainActivity extends Activity {
         root.addView(web, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
+        // Small "Home" button over the camera view (top left, away from the
+        // Pi page's own VR/Settings buttons). The main screen covers it when shown.
+        Button home = new Button(this);
+        home.setText("⌂ Home");
+        home.setAllCaps(false);
+        home.setTextColor(Color.WHITE);
+        home.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        home.setPadding(dp(14), 0, dp(14), 0);
+        styleButton(home, "#88000000");
+        home.setOnClickListener(v -> showPanel(currentHost != null
+                ? "Connected to " + currentHost + ".\nPress Back to return to the camera."
+                : ""));
+        FrameLayout.LayoutParams hlp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(44), Gravity.TOP | Gravity.START);
+        hlp.setMargins(dp(10), dp(10), 0, 0);
+        root.addView(home, hlp);
+
         connectPanel = buildConnectPanel();
         root.addView(connectPanel, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
