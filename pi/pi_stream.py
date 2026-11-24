@@ -339,6 +339,26 @@ NORMAL_PAGE = """<!DOCTYPE html>
   #zoomval{color:#e8e2c0;font:bold 18px "Courier New",monospace;margin:12px 0;
            text-shadow:0 0 3px #000}
   #zoombar.faded{opacity:0;pointer-events:none}
+  #rotatehint{display:none;position:fixed;left:0;right:0;text-align:center;
+              color:#888;font:14px sans-serif}
+
+  /* ---- Phone held upright: picture at the top, controls underneath ---- */
+  body.portrait{align-items:flex-start}
+  body.portrait #stage{margin-top:52px}
+  body.portrait #controls{left:3vw;right:3vw;bottom:auto;-webkit-transform:none;transform:none;
+           display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+  body.portrait #controls button{padding:12px 0;font-size:15px}
+  body.portrait #zoombar{right:auto;left:50%;margin-left:-110px;margin-top:0;width:220px;
+           flex-direction:row;justify-content:space-between}
+  body.portrait #zoomval{margin:0 10px}
+  body.portrait #rotatehint{display:block}
+
+  /* ---- Wide screens with room at the sides: controls in the side bars ---- */
+  body.side #controls{left:0;bottom:auto;top:50%;-webkit-transform:translateY(-50%);
+           transform:translateY(-50%);flex-direction:column;padding:0 8px;box-sizing:border-box}
+  body.side #controls button{font-size:13px;padding:9px 2px}
+  body.side nav{flex-direction:column;align-items:flex-end}
+  body.side nav a{font-size:13px;padding:5px 8px}
 
   /* ---- HUD ---- */
   .hud{position:absolute;color:#e8e2c0;font-size:18px;
@@ -449,6 +469,7 @@ NORMAL_PAGE = """<!DOCTYPE html>
   <div id="zoomval">1.0x</div>
   <button id="zout">&minus;</button>
 </div>
+<div id="rotatehint">Turn your phone sideways for a bigger picture</div>
 <div id="controls">
   <button data-view="driver">DRIVER</button>
   <button data-view="gunner">GUNNER</button>
@@ -462,14 +483,44 @@ NORMAL_PAGE = """<!DOCTYPE html>
   // ---- Keep the picture 4:3 and as large as the screen allows ----
   var stage = document.getElementById('stage');
   function fit(){
-    var w = window.innerWidth, h = window.innerHeight;
-    if (w / h > 4 / 3) w = h * 4 / 3; else h = w * 3 / 4;
+    var W = window.innerWidth, H = window.innerHeight, w, h;
+    var portrait = H > W;
+    var body = document.body;
+    var controls = document.getElementById('controls');
+    var zoombar = document.getElementById('zoombar');
+    var hint = document.getElementById('rotatehint');
+
+    if (portrait) { w = W; h = W * 3 / 4; }
+    else { w = W; h = H; if (w / h > 4 / 3) w = h * 4 / 3; else h = w * 3 / 4; }
     stage.style.width = Math.round(w) + 'px';
     stage.style.height = Math.round(h) + 'px';
+
+    var sideRoom = (W - w) / 2;
+    var side = !portrait && sideRoom >= 90;
+    body.classList.toggle('portrait', portrait);
+    body.classList.toggle('side', side);
+
+    // reset anything set for a previous orientation
+    controls.style.top = controls.style.width = '';
+    zoombar.style.top = zoombar.style.right = '';
+    if (portrait) {
+      var y = 52 + h + 16;
+      controls.style.top = y + 'px';
+      y += controls.offsetHeight + 18;
+      zoombar.style.top = y + 'px';
+      hint.style.top = (y + 90) + 'px';
+    } else if (side) {
+      controls.style.width = Math.floor(Math.min(sideRoom, 140)) + 'px';
+      zoombar.style.right = Math.max(6, Math.round((sideRoom - 64) / 2)) + 'px';
+    }
+
+    // Text sizes follow the picture size; short title on small screens
     var f = Math.max(11, Math.round(h * 0.032));
     var hud = document.querySelectorAll('.hud');
     for (var i = 0; i < hud.length; i++) hud[i].style.fontSize = f + 'px';
     document.getElementById('slitlabel').style.fontSize = Math.round(f * 0.9) + 'px';
+    document.getElementById('h-title').innerHTML = w < 560
+      ? 'PZKPFW VI &middot; TIGER' : 'PANZERKAMPFWAGEN VI &middot; TIGER';
   }
   fit(); window.addEventListener('resize', fit);
 
@@ -539,6 +590,8 @@ NORMAL_PAGE = """<!DOCTYPE html>
     document.getElementById('zoombar').classList.remove('faded');
     clearTimeout(fadeTimer);
     fadeTimer = setTimeout(function(){
+      var b = document.body.classList;
+      if (b.contains('portrait') || b.contains('side')) return;
       document.getElementById('controls').classList.add('faded');
       document.getElementById('nav').classList.add('faded');
       document.getElementById('zoombar').classList.add('faded');
