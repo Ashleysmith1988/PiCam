@@ -38,6 +38,7 @@ FRAMERATE = 24
 PORT = 8000
 QUALITY = Quality.MEDIUM     # LOW / MEDIUM / HIGH / VERY_HIGH
 FLIP = True                  # rotate 180 degrees
+ZOOM_MAX = 4.0               # highest binocular zoom (sensor crop)
 
 # ---- Network settings -------------------------------------------------------
 HOTSPOT_CON = "Hotspot"      # NetworkManager connection name
@@ -166,6 +167,50 @@ def net_status():
             "saved": saved_home_networks(), "hotspot_ssid": HOTSPOT_SSID}
 
 
+# ================================ Zoom =======================================
+camera = None          # set at start-up
+zoom_level = 1.0
+
+
+def pick_sensor_mode(cam):
+    """Choose the most detailed sensor mode that still sees the full view
+    and keeps up with FRAMERATE, so zooming in shows real extra detail."""
+    try:
+        modes = cam.sensor_modes
+        full = max(m["crop_limits"][2] * m["crop_limits"][3] for m in modes)
+        ok = [m for m in modes
+              if m["crop_limits"][2] * m["crop_limits"][3] >= 0.95 * full
+              and m.get("fps", 0) >= FRAMERATE]
+        if not ok:
+            return {}
+        best = max(ok, key=lambda m: m["size"][0] * m["size"][1])
+        logging.info("Sensor mode %s @ %.0f fps", best["size"], best.get("fps", 0))
+        return {"output_size": best["size"], "bit_depth": best["bit_depth"]}
+    except Exception as e:
+        logging.info("Using default sensor mode (%s)", e)
+        return {}
+
+
+def set_zoom(z):
+    """Crop the middle of the sensor. 1.0 = full view."""
+    global zoom_level
+    z = max(1.0, min(ZOOM_MAX, float(z)))
+    try:
+        _, (x0, y0, w0, h0), _ = camera.camera_controls["ScalerCrop"]
+        ratio = WIDTH / HEIGHT                      # keep the picture 4:3
+        if w0 / h0 > ratio:
+            nw = int(h0 * ratio); x0 += (w0 - nw) // 2; w0 = nw
+        else:
+            nh = int(w0 / ratio); y0 += (h0 - nh) // 2; h0 = nh
+        w, h = int(w0 / z) & ~1, int(h0 / z) & ~1
+        x, y = x0 + (w0 - w) // 2, y0 + (h0 - h) // 2
+        camera.set_controls({"ScalerCrop": (x, y, w, h)})
+        zoom_level = z
+    except Exception as e:
+        logging.info("Zoom failed: %s", e)
+    return zoom_level
+
+
 # ============================== Self-update ==================================
 def _short_hash(data):
     # Line endings are ignored so a Windows/Linux difference isn't "an update"
@@ -286,8 +331,14 @@ NORMAL_PAGE = """<!DOCTYPE html>
   #reticle{width:100%;height:100%}
 
   /* ---- Binoculars: two eyepieces, 1.6x zoom ---- */
-  #cam{transition:transform .3s}
-  body.zoom #cam{-webkit-transform:scale(1.6);transform:scale(1.6)}
+  #zoombar{position:fixed;right:14px;top:50%;margin-top:-95px;z-index:10;
+           display:flex;flex-direction:column;align-items:center;transition:opacity .4s}
+  #zoombar button{width:64px;height:64px;font:bold 32px sans-serif;color:#eee;
+           background:#000a;border:1px solid #888;border-radius:50%}
+  #zoombar button:active{background:#7a6a2a}
+  #zoomval{color:#e8e2c0;font:bold 18px "Courier New",monospace;margin:12px 0;
+           text-shadow:0 0 3px #000}
+  #zoombar.faded{opacity:0;pointer-events:none}
 
   /* ---- HUD ---- */
   .hud{position:absolute;color:#e8e2c0;font-size:18px;
@@ -393,6 +444,11 @@ NORMAL_PAGE = """<!DOCTYPE html>
 </div>
 
 <nav id="nav"><a href="/vr">VR mode</a><a href="/settings">Settings</a></nav>
+<div id="zoombar" class="hidden">
+  <button id="zin">+</button>
+  <div id="zoomval">1.0x</div>
+  <button id="zout">&minus;</button>
+</div>
 <div id="controls">
   <button data-view="driver">DRIVER</button>
   <button data-view="gunner">GUNNER</button>
@@ -417,6 +473,32 @@ NORMAL_PAGE = """<!DOCTYPE html>
   }
   fit(); window.addEventListener('resize', fit);
 
+  // ---- Binocular zoom (done on the Pi by cropping the camera sensor) ----
+  var ZOOM_STEPS = [1, 1.25, 1.5, 2, 2.5, 3, 4];
+  function sendZoom(z){
+    document.getElementById('zoomval').textContent = z.toFixed(1) + 'x';
+    var x = new XMLHttpRequest();
+    x.open('POST', '/api/zoom');
+    x.setRequestHeader('Content-Type', 'application/json');
+    x.onload = function(){
+      try {
+        var r = JSON.parse(x.responseText);
+        document.getElementById('zoomval').textContent = r.zoom.toFixed(1) + 'x';
+      } catch(e) {}
+    };
+    x.send(JSON.stringify({zoom: z}));
+  }
+  function stepZoom(dir){
+    var cur = state.zoom || 1.5, next = cur, i;
+    if (dir > 0) {
+      for (i = 0; i < ZOOM_STEPS.length; i++) if (ZOOM_STEPS[i] > cur) { next = ZOOM_STEPS[i]; break; }
+    } else {
+      for (i = ZOOM_STEPS.length - 1; i >= 0; i--) if (ZOOM_STEPS[i] < cur) { next = ZOOM_STEPS[i]; break; }
+    }
+    state.zoom = next;
+    save(); sendZoom(state.zoom); wake();
+  }
+
   // ---- Saved settings (kept per device; falls back to defaults) ----
   var state = {view:'driver', hud:true, film:true};
   try { var s = JSON.parse(localStorage.getItem('picamOverlay')); if (s) state = s; } catch(e) {}
@@ -426,7 +508,9 @@ NORMAL_PAGE = """<!DOCTYPE html>
     document.getElementById('driver').classList.toggle('hidden', state.view !== 'driver');
     document.getElementById('gunner').classList.toggle('hidden', state.view !== 'gunner');
     document.getElementById('binos').classList.toggle('hidden', state.view !== 'binos');
-    document.body.classList.toggle('zoom', state.view === 'binos');
+    document.getElementById('zoombar').classList.toggle('hidden', state.view !== 'binos');
+    // Binoculars use the saved zoom; every other view goes back to the full picture
+    sendZoom(state.view === 'binos' ? (state.zoom || 1.5) : 1);
     document.getElementById('hud').classList.toggle('hidden', !state.hud);
     document.getElementById('film').classList.toggle('hidden', !state.film);
     document.body.classList.toggle('film', state.film);
@@ -444,16 +528,20 @@ NORMAL_PAGE = """<!DOCTYPE html>
     });
   });
   apply();
+  document.getElementById('zin').addEventListener('click', function(ev){ ev.stopPropagation(); stepZoom(1); });
+  document.getElementById('zout').addEventListener('click', function(ev){ ev.stopPropagation(); stepZoom(-1); });
 
   // ---- Controls fade after 4 s; tap anywhere to bring them back ----
   var fadeTimer;
   function wake(){
     document.getElementById('controls').classList.remove('faded');
     document.getElementById('nav').classList.remove('faded');
+    document.getElementById('zoombar').classList.remove('faded');
     clearTimeout(fadeTimer);
     fadeTimer = setTimeout(function(){
       document.getElementById('controls').classList.add('faded');
       document.getElementById('nav').classList.add('faded');
+      document.getElementById('zoombar').classList.add('faded');
     }, 4000);
   }
   document.body.addEventListener('click', wake);
@@ -741,6 +829,8 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self._send(VR_PAGE)
         elif path == "/settings":
             self._send(SETTINGS_PAGE.replace("__HOTSPOT__", HOTSPOT_SSID))
+        elif path == "/api/zoom":
+            self._json({"zoom": zoom_level, "max": ZOOM_MAX})
         elif path == "/api/ping":
             self._send("ok", "text/plain")
         elif path == "/api/status":
@@ -772,6 +862,11 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             else:
                 return self._json({"ok": False, "error": "unknown mode"}, 400)
             self._json({"ok": True})
+        elif self.path == "/api/zoom":
+            try:
+                self._json({"zoom": set_zoom(body.get("zoom", 1)), "max": ZOOM_MAX})
+            except (TypeError, ValueError):
+                self._json({"ok": False, "error": "bad zoom"}, 400)
         elif self.path == "/api/update/install":
             try:
                 version = install_update()
@@ -833,9 +928,11 @@ if __name__ == "__main__":
     threading.Thread(target=boot_fallback, daemon=True).start()
 
     picam2 = Picamera2()
+    camera = picam2
     config = picam2.create_video_configuration(
         main={"size": (WIDTH, HEIGHT)},
         controls={"FrameRate": FRAMERATE},
+        sensor=pick_sensor_mode(picam2),
     )
     if FLIP:
         from libcamera import Transform
